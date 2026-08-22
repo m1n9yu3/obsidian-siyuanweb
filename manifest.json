@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-siyuanweb",
+  "name": "SiYuan Web Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Manually sync Obsidian notes to SiYuan via SiYuan API.",
+  "author": "obsidian-siyuanweb",
+  "isDesktopOnly": false
+}
+
