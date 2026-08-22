@@ -85,7 +85,9 @@ function normalizeWikiImageLinks(md: string): string {
   });
 }
 
-/** Resolve an image link target to a TFile using Obsidian's link resolution first. */
+/** Resolve an image link target to a TFile using Obsidian's link resolution first,
+ * then vault-relative lookup, then a vault-wide filename search (covers unattached
+ * images in folders like attach/ that metadataCache may not have indexed yet). */
 function resolveImageFile(app: App, sourceFile: TFile, target: string): TFile | null {
   const byLink = app.metadataCache.getFirstLinkpathDest(target, sourceFile.path);
   if (byLink instanceof TFile) return byLink;
@@ -93,7 +95,10 @@ function resolveImageFile(app: App, sourceFile: TFile, target: string): TFile | 
   if (direct instanceof TFile) return direct;
   const dir = sourceFile.parent?.path ?? '';
   const relative = app.vault.getAbstractFileByPath(dir ? `${dir}/${target}` : target);
-  return relative instanceof TFile ? relative : null;
+  if (relative instanceof TFile) return relative;
+  const name = target.split('/').pop() ?? target;
+  const found = app.vault.getFiles().filter((f) => f.name === name);
+  return found.length === 1 ? found[0] : found.length > 1 ? found[0] : null;
 }
 
 /** Decode a data: URI payload into bytes and the MIME type. */
@@ -145,7 +150,8 @@ async function prepareMarkdown(
   sourceFile: TFile,
   md: string,
 ): Promise<PreparedMarkdown> {
-  const normalized = normalizeWikiImageLinks(md);
+  // Work on the normalized string end-to-end so wiki link rewrites and asset rewrites share the same source of truth.
+  let normalized = normalizeWikiImageLinks(md);
   const imageRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
   const uploads = new Map<string, string>();
   const failed: string[] = [];
@@ -175,7 +181,7 @@ async function prepareMarkdown(
       try {
         const assetPath = await api.uploadAsset(fileName, decoded.bytes, mime);
         uploads.set(target, assetPath);
-        md = md.replace(raw, `![${alt}](${assetPath})`);
+        normalized = normalized.replace(raw, `![${alt}](${assetPath})`);
         uploaded++;
       } catch (e) {
         failed.push(`${fileName}: ${e instanceof Error ? e.message : String(e)}`);
@@ -192,7 +198,7 @@ async function prepareMarkdown(
 
     const cached = uploads.get(tf.path);
     if (cached) {
-      md = md.replace(raw, `![${alt}](${cached})`);
+      normalized = normalized.replace(raw, `![${alt}](${cached})`);
       continue;
     }
 
@@ -202,13 +208,13 @@ async function prepareMarkdown(
       const assetPath = await api.uploadAsset(tf.name, bytes, mime);
       uploads.set(tf.path, assetPath);
       imageFiles.push(tf);
-      md = md.replace(raw, `![${alt}](${assetPath})`);
+      normalized = normalized.replace(raw, `![${alt}](${assetPath})`);
       uploaded++;
     } catch (e) {
       failed.push(`${tf.path}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  return { md, uploaded, failed, imageFiles };
+  return { md: normalized, uploaded, failed, imageFiles };
 }
 
 export default class SiYuanSyncPlugin extends Plugin {
@@ -509,4 +515,8 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
     }
   }
 }
+
+
+
+
 
