@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "tsx --test tests/markdown.test.ts tests/prepare.test.ts tests/sync-logic.test.ts tests/siyuan-api.test.ts tests/paths.test.ts tests/upsert.test.ts"
   },
   "keywords": ["obsidian", "siyuan", "sync"],
   "author": "obsidian-siyuanweb",
@@ -16,6 +17,7 @@
     "esbuild": "^0.28.2",
     "obsidian": "^1.13.1",
     "tslib": "^2.6.2",
+    "tsx": "^4.19.0",
     "typescript": "^5.4.0"
   }
 }

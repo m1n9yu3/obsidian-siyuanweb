@@ -1,65 +1,71 @@
-import { App, MarkdownView, Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder } from 'obsidian';
+import {
+  App,
+  MarkdownView,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  Notice,
+  TFile,
+  TFolder,
+  requestUrl,
+} from 'obsidian';
 import { SiYuanApi, Notebook, FileTreeItem } from './siyuan-api';
+import { isImageExt } from './markdown';
+import {
+  collectLocalImages,
+  prepareMarkdown,
+  fingerprintPrepared,
+  ImageResolver,
+  MAX_REMOTE_BYTES,
+  remoteFetchHeaders,
+  sniffImageMime,
+} from './prepare';
+import { claimedHPaths, isUnderLocalFolder, mapVaultPathToHPath, syncRootHPath } from './paths';
+import { RemoteTree } from './remote-tree';
+import { collapseAllDuplicates, collapseLineage, noteNeedsRelocate, writeNote } from './upsert';
+import {
+  dropSyncStateKeys,
+  isRemovableRemoteDoc,
+  NoteSyncRecord,
+  planNoteSync,
+  recordOf,
+  remapSyncStateKeys,
+  resolveNotebook,
+} from './sync-logic';
 
 interface SyncSettings {
   baseUrl: string;
   token: string;
+  /** User-typed notebook name or ID. Saved per Obsidian vault. */
+  notebook: string;
   notebookId: string;
+  localFolder: string;
+  remoteDir: string;
   createMissingNotebook: boolean;
   removeMissingNotes: boolean;
 }
 
 interface SyncState {
-  [path: string]: string; // local path -> fingerprint
+  [path: string]: NoteSyncRecord | string;
 }
 
 const DEFAULT_SETTINGS: SyncSettings = {
   baseUrl: 'http://127.0.0.1:6806',
   token: '',
+  notebook: '',
   notebookId: '',
+  localFolder: '',
+  remoteDir: '',
   createMissingNotebook: false,
   removeMissingNotes: false,
 };
 
 const DEFAULT_STATE: SyncState = {};
 
-function siyuanPathFor(file: TFile): string {
-  return `/${file.path}`;
+function syncRecord(fp: string, id: string, imageFailures: number): NoteSyncRecord {
+  return imageFailures > 0 ? { fp, id, imgFail: imageFailures } : { fp, id };
 }
 
-/** Build a map from human-readable path (e.g. /folder/note.md) to filetree entry.
- * Uses getHPathByID so same-named folders in different parents are not confused. */
-async function buildDocPathIndex(
-  api: SiYuanApi,
-  notebookId: string,
-): Promise<Map<string, FileTreeItem>> {
-  const all: FileTreeItem[] = [];
-  await collectAllDocs(api, notebookId, '/', all);
-  const index = new Map<string, FileTreeItem>();
-  for (const doc of all) {
-    try {
-      const hPath = await api.getHPathByID(doc.id);
-      if (hPath && hPath !== '/') {
-        index.set(hPath, doc);
-      }
-    } catch {
-      // Skip entries that cannot be resolved; they will be recreated on sync.
-    }
-  }
-  return index;
-}
-
-/** Find the filetree entry whose human-readable path equals the target path. */
-async function findDocByHPath(
-  api: SiYuanApi,
-  notebookId: string,
-  target: string,
-): Promise<FileTreeItem | null> {
-  const index = await buildDocPathIndex(api, notebookId);
-  return index.get(target) ?? null;
-}
-
-/** Recursively collect every doc entry (leaf and container) in a notebook. */
 async function collectAllDocs(
   api: SiYuanApi,
   notebookId: string,
@@ -85,150 +91,76 @@ async function collectMarkdownFiles(folder: TFolder, files: TFile[]): Promise<vo
   }
 }
 
-/** Replace ![[img.png]] with ![img.png](img.png) so uploader can process it. */
-function normalizeWikiImageLinks(md: string): string {
-  return md.replace(/!\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]/g, (m, target: string) => {
-    const t = target.trim();
-    return `![${t}](${t})`;
-  });
+function decodeLinkTarget(target: string): string {
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return target;
+  }
 }
 
-/** Resolve an image link target to a TFile using Obsidian's link resolution first,
- * then vault-relative lookup, then a vault-wide filename search (covers unattached
- * images in folders like attach/ that metadataCache may not have indexed yet). */
+/** Resolve an image link. Never picks an arbitrary file when several share the same name. */
 function resolveImageFile(app: App, sourceFile: TFile, target: string): TFile | null {
-  const byLink = app.metadataCache.getFirstLinkpathDest(target, sourceFile.path);
+  const decoded = decodeLinkTarget(target.trim());
+  const byLink = app.metadataCache.getFirstLinkpathDest(decoded, sourceFile.path);
   if (byLink instanceof TFile) return byLink;
-  const direct = app.vault.getAbstractFileByPath(target);
+  const direct = app.vault.getAbstractFileByPath(decoded);
   if (direct instanceof TFile) return direct;
   const dir = sourceFile.parent?.path ?? '';
-  const relative = app.vault.getAbstractFileByPath(dir ? `${dir}/${target}` : target);
+  const relative = app.vault.getAbstractFileByPath(dir ? `${dir}/${decoded}` : decoded);
   if (relative instanceof TFile) return relative;
-  const name = target.split('/').pop() ?? target;
-  const found = app.vault.getFiles().filter((f) => f.name === name);
-  return found.length === 1 ? found[0] : found.length > 1 ? found[0] : null;
+  const name = decoded.split('/').pop() ?? decoded;
+  const found = app.vault.getFiles().filter((f) => f.name === name && isImageExt(f.extension));
+  return found.length === 1 ? found[0] : null;
 }
 
-/** Decode a data: URI payload into bytes and the MIME type. */
-function decodeDataUri(uri: string): { bytes: ArrayBuffer; mime: string } | null {
-  const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(uri);
-  if (!m) return null;
-  const mime = m[1] || 'application/octet-stream';
-  const payload = m[3];
-  if (!m[2]) {
-    // Percent-encoded data URI (rare in markdown images).
-    const decoded = decodeURIComponent(payload);
-    return { bytes: new TextEncoder().encode(decoded).buffer, mime };
+async function obsidianFetchRemote(url: string): Promise<{ bytes: ArrayBuffer; mime: string }> {
+  const resp = await requestUrl({
+    url,
+    method: 'GET',
+    headers: remoteFetchHeaders(url),
+    throw: false,
+  });
+  if (resp.status < 200 || resp.status >= 400) {
+    throw new Error(`HTTP ${resp.status}`);
   }
-  try {
-    const bin = atob(payload.replace(/\s+/g, ''));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return { bytes: bytes.buffer, mime };
-  } catch {
-    return null;
+  const headerMime = (resp.headers['content-type'] || resp.headers['Content-Type'] || '')
+    .split(';')[0]
+    .trim();
+  const bytes = resp.arrayBuffer;
+  if (!bytes || bytes.byteLength === 0) throw new Error('empty response');
+  if (bytes.byteLength > MAX_REMOTE_BYTES) {
+    throw new Error(`image too large (${bytes.byteLength} bytes)`);
   }
+  return { bytes, mime: sniffImageMime(bytes, headerMime, url) };
 }
 
-/** Simple stable fingerprint for a markdown note plus the images it embeds. */
-async function fingerprintFor(
-  app: App,
-  sourceFile: TFile,
-  md: string,
-  imageFiles: TFile[],
-): Promise<string> {
-  const parts: string[] = [md];
-  for (const f of imageFiles) {
-    parts.push(`${f.path}:${f.stat.mtime}:${f.stat.size}`);
-  }
-  return parts.join('\n---\n');
-}
-
-interface PreparedMarkdown {
-  md: string;
-  uploaded: number;
-  failed: string[];
-  imageFiles: TFile[];
-}
-
-/** Upload local and base64 images, rewriting markdown links to SiYuan assets. */
-async function prepareMarkdown(
-  app: App,
-  api: SiYuanApi,
-  sourceFile: TFile,
-  md: string,
-): Promise<PreparedMarkdown> {
-  // Work on the normalized string end-to-end so wiki link rewrites and asset rewrites share the same source of truth.
-  let normalized = normalizeWikiImageLinks(md);
-  const imageRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
-  const uploads = new Map<string, string>();
-  const failed: string[] = [];
-  const imageFiles: TFile[] = [];
-  let uploaded = 0;
-
-  const matches: { raw: string; alt: string; target: string }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = imageRe.exec(normalized))) {
-    matches.push({ raw: m[0], alt: m[1], target: m[2].trim() });
-  }
-
-  for (const { raw, alt, target } of matches) {
-    if (/^(https?:|obsidian:|app:|file:)/i.test(target)) continue;
-
-    // Inline base64 image: decode and upload as an asset.
-    if (/^data:/i.test(target)) {
-      const decoded = decodeDataUri(target);
-      if (!decoded) {
-        failed.push('invalid data URI');
-        continue;
-      }
-      const mime = decoded.mime;
-      const extMatch = /^image\/([a-zA-Z0-9+.-]+)/.exec(mime);
-      const ext = extMatch ? extMatch[1].replace('jpeg', 'jpg') : 'png';
-      const fileName = `obsidian-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      try {
-        const assetPath = await api.uploadAsset(fileName, decoded.bytes, mime);
-        uploads.set(target, assetPath);
-        normalized = normalized.replace(raw, `![${alt}](${assetPath})`);
-        uploaded++;
-      } catch (e) {
-        failed.push(`${fileName}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      continue;
-    }
-
-    // Local file image: resolve and upload (dedupe per note by file path).
-    const tf = resolveImageFile(app, sourceFile, target);
-    if (!tf) {
-      failed.push(target);
-      continue;
-    }
-
-    const cached = uploads.get(tf.path);
-    if (cached) {
-      normalized = normalized.replace(raw, `![${alt}](${cached})`);
-      continue;
-    }
-
-    try {
-      const bytes = await app.vault.readBinary(tf);
-      const mime = `image/${tf.extension}`;
-      const assetPath = await api.uploadAsset(tf.name, bytes, mime);
-      uploads.set(tf.path, assetPath);
-      imageFiles.push(tf);
-      normalized = normalized.replace(raw, `![${alt}](${assetPath})`);
-      uploaded++;
-    } catch (e) {
-      failed.push(`${tf.path}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  return { md: normalized, uploaded, failed, imageFiles };
+function makeResolver(app: App, sourceFile: TFile): ImageResolver {
+  return {
+    resolve: (_sourcePath, target) => {
+      const tf = resolveImageFile(app, sourceFile, target);
+      if (!tf || !isImageExt(tf.extension)) return null;
+      return {
+        path: tf.path,
+        name: tf.name,
+        extension: tf.extension,
+        mtime: tf.stat.mtime,
+        size: tf.stat.size,
+      };
+    },
+    readBinary: async (path) => {
+      const f = app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof TFile)) throw new Error(`Missing file: ${path}`);
+      return app.vault.readBinary(f);
+    },
+  };
 }
 
 export default class SiYuanSyncPlugin extends Plugin {
   settings: SyncSettings = DEFAULT_SETTINGS;
   private syncState: SyncState = { ...DEFAULT_STATE };
   private api!: SiYuanApi;
+  private syncing = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -265,14 +197,34 @@ export default class SiYuanSyncPlugin extends Plugin {
     });
 
     this.addSettingTab(new SiYuanSyncSettingTab(this.app, this));
+
+    this.registerEvent(
+      this.app.vault.on('rename', (file, oldPath) => {
+        const next = remapSyncStateKeys(this.syncState, oldPath, file.path);
+        if (next === this.syncState) return;
+        this.syncState = next;
+        void this.saveSettings();
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on('delete', (file) => {
+        const next = dropSyncStateKeys(this.syncState, file.path);
+        if (next === this.syncState) return;
+        this.syncState = next;
+        void this.saveSettings();
+      }),
+    );
   }
 
   onunload(): void {}
 
   private async loadSettings(): Promise<void> {
     const data = (await this.loadData()) as (SyncSettings & { syncState?: SyncState }) | null;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
-    this.syncState = Object.assign({}, DEFAULT_STATE, data?.syncState ?? {});
+    const syncState = data?.syncState;
+    const rest = { ...(data ?? {}) } as Partial<SyncSettings> & { syncState?: SyncState };
+    delete rest.syncState;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
+    this.syncState = Object.assign({}, DEFAULT_STATE, syncState ?? {});
   }
 
   async saveSettings(): Promise<void> {
@@ -280,118 +232,233 @@ export default class SiYuanSyncPlugin extends Plugin {
     this.api = new SiYuanApi(this.settings.baseUrl, this.settings.token);
   }
 
-  private async syncFile(file: TFile): Promise<void> {
-    try {
-      const nb = await this.ensureNotebook();
-      const rawMd = await this.app.vault.read(file);
-      const prepared = await prepareMarkdown(this.app, this.api, file, rawMd);
-      const fp = await fingerprintFor(this.app, file, prepared.md, prepared.imageFiles);
-      const path = siyuanPathFor(file);
-      const index = await buildDocPathIndex(this.api, nb.id);
+  private noteHPath(file: TFile): string {
+    return mapVaultPathToHPath(file.path, this.settings.localFolder, this.settings.remoteDir);
+  }
 
-      if (this.syncState[file.path] === fp) {
-        const existing = index.get(path);
-        if (existing) {
-          new Notice(`SiYuan: skipped ${file.name} (unchanged)`);
-          return;
+  private syncRoot(): string {
+    return syncRootHPath(this.settings.localFolder, this.settings.remoteDir);
+  }
+
+  private localSyncFolder(): TFolder {
+    const raw = this.settings.localFolder.trim();
+    if (!raw) return this.app.vault.getRoot();
+    const rel = raw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const found = this.app.vault.getAbstractFileByPath(rel);
+    if (found instanceof TFolder) return found;
+    throw new Error(`Local folder not found: ${raw}`);
+  }
+
+  private beginSync(): boolean {
+    if (this.syncing) {
+      new Notice('SiYuan: a sync is already running.');
+      return false;
+    }
+    this.syncing = true;
+    return true;
+  }
+
+  private endSync(): void {
+    this.syncing = false;
+  }
+
+  private async loadRemoteTree(notebookId: string): Promise<RemoteTree> {
+    try {
+      return RemoteTree.fromRows(await this.api.queryDocs(notebookId));
+    } catch {
+      const all: FileTreeItem[] = [];
+      await collectAllDocs(this.api, notebookId, '/', all);
+      const rows: Array<{ id: string; hpath: string; path: string }> = [];
+      for (const doc of all) {
+        try {
+          const hPath = await this.api.getHPathByID(doc.id);
+          rows.push({ id: doc.id, hpath: hPath || '/', path: doc.path });
+        } catch {
+          // Skip docs the kernel cannot resolve.
         }
       }
+      return RemoteTree.fromRows(rows);
+    }
+  }
 
-      const existing = index.get(path);
-      if (existing) {
-        await this.api.removeDoc(nb.id, existing.path);
+  private async syncFile(file: TFile): Promise<void> {
+    if (!this.beginSync()) return;
+    try {
+      if (!isUnderLocalFolder(file.path, this.settings.localFolder)) {
+        new Notice(`SiYuan: ${file.path} is outside the configured local folder.`);
+        return;
       }
-      await this.api.createDocWithMd(nb.id, path, prepared.md);
-      this.syncState[file.path] = fp;
+      const nb = await this.ensureNotebook();
+      const hPath = this.noteHPath(file);
+      const rawMd = await this.app.vault.read(file);
+      const resolver = makeResolver(this.app, file);
+      const images = collectLocalImages(file.path, rawMd, resolver);
+      const fp = fingerprintPrepared(rawMd, images);
+      const rec = recordOf(this.syncState[file.path]);
+      const tree = await this.loadRemoteTree(nb.id);
+      const existing = tree.findById(rec.id ?? '') ?? tree.findOne(hPath) ?? tree.resolve(file.path, rec.id);
+      const action = planNoteSync({
+        storedFingerprint: rec.fp,
+        currentFingerprint: fp,
+        remoteExists: Boolean(existing),
+        imageFailures: rec.imgFail,
+      });
+
+      if (action === 'skip' && existing && !noteNeedsRelocate(existing, hPath)) {
+        await collapseLineage(this.api, nb.id, tree, hPath);
+        this.syncState[file.path] = { fp, id: existing.id };
+        await this.saveSettings();
+        new Notice(`SiYuan: skipped ${file.name} (unchanged)`);
+        return;
+      }
+
+      const prepared = await prepareMarkdown(file.path, rawMd, resolver, this.api, {
+        fetchRemote: { fetch: obsidianFetchRemote },
+      });
+      const result = await writeNote({
+        api: this.api,
+        notebookId: nb.id,
+        localPath: file.path,
+        hPath,
+        markdown: prepared.md,
+        storedId: rec.id ?? existing?.id,
+        tree,
+      });
+      this.syncState[file.path] = syncRecord(fp, result.id, prepared.failed.length);
       await this.saveSettings();
 
       const imgNote = prepared.uploaded > 0 ? `, ${prepared.uploaded} images` : '';
       const failNote = prepared.failed.length > 0 ? ` (${prepared.failed.length} image failed)` : '';
-      new Notice(`SiYuan: ${existing ? 'updated' : 'created'} ${file.name}${imgNote}${failNote}`);
+      new Notice(
+        `SiYuan: ${result.created ? 'created' : 'updated'} ${file.name}${imgNote}${failNote}`,
+      );
     } catch (e) {
       new Notice(`SiYuan sync failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.endSync();
     }
   }
 
   private async syncAll(): Promise<void> {
+    if (!this.beginSync()) return;
     let nb: Notebook;
     try {
       nb = await this.ensureNotebook();
     } catch (e) {
+      this.endSync();
       new Notice(`SiYuan sync failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
 
     const files: TFile[] = [];
-    await collectMarkdownFiles(this.app.vault.getRoot(), files);
-    const localPaths = new Set(files.map((f) => `/${f.path}`));
-    const docIndex = await buildDocPathIndex(this.api, nb.id);
+    let folder: TFolder;
+    try {
+      folder = this.localSyncFolder();
+    } catch (e) {
+      this.endSync();
+      new Notice(`SiYuan sync failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    await collectMarkdownFiles(folder, files);
+    const claimed = claimedHPaths(files.map((f) => this.noteHPath(f)));
+    const root = this.syncRoot();
+    const tree = await this.loadRemoteTree(nb.id);
 
     let ok = 0;
     let created = 0;
     let updated = 0;
     let skipped = 0;
     let removed = 0;
+    let collapsed = 0;
     let images = 0;
     const errors: string[] = [];
     const notice = new Notice(`Syncing to SiYuan... 0/${files.length}`, 0);
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      notice.setMessage(`Syncing to SiYuan... ${i + 1}/${files.length}: ${file.path}`);
-      try {
-        const rawMd = await this.app.vault.read(file);
-        const prepared = await prepareMarkdown(this.app, this.api, file, rawMd);
-        images += prepared.uploaded;
-        if (prepared.failed.length > 0) {
-          errors.push(`${file.path}: images failed: ${prepared.failed.join(', ')}`);
-        }
-        const fp = await fingerprintFor(this.app, file, prepared.md, prepared.imageFiles);
-        const path = siyuanPathFor(file);
+    try {
+      collapsed += await collapseAllDuplicates(this.api, nb.id, tree, root);
 
-        if (this.syncState[file.path] === fp) {
-          const existing = docIndex.get(path);
-          if (existing) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        notice.setMessage(`Syncing to SiYuan... ${i + 1}/${files.length}: ${file.path}`);
+        try {
+          const rawMd = await this.app.vault.read(file);
+          const resolver = makeResolver(this.app, file);
+          const localImages = collectLocalImages(file.path, rawMd, resolver);
+          const fp = fingerprintPrepared(rawMd, localImages);
+          const rec = recordOf(this.syncState[file.path]);
+          const hPath = this.noteHPath(file);
+          const existing =
+            tree.findById(rec.id ?? '') ?? tree.findOne(hPath) ?? tree.resolve(file.path, rec.id);
+          const action = planNoteSync({
+            storedFingerprint: rec.fp,
+            currentFingerprint: fp,
+            remoteExists: Boolean(existing),
+            imageFailures: rec.imgFail,
+          });
+
+          if (action === 'skip' && existing && !noteNeedsRelocate(existing, hPath)) {
+            this.syncState[file.path] = { fp, id: existing.id };
             skipped++;
             continue;
           }
-        }
 
-        const existing = docIndex.get(path);
-        if (existing) {
-          await this.api.removeDoc(nb.id, existing.path);
-          updated++;
-        } else {
-          created++;
+          const prepared = await prepareMarkdown(file.path, rawMd, resolver, this.api, {
+            fetchRemote: { fetch: obsidianFetchRemote },
+          });
+          images += prepared.uploaded;
+          if (prepared.failed.length > 0) {
+            errors.push(`${file.path}: images failed: ${prepared.failed.join(', ')}`);
+          }
+          const result = await writeNote({
+            api: this.api,
+            notebookId: nb.id,
+            localPath: file.path,
+            hPath,
+            markdown: prepared.md,
+            storedId: rec.id ?? existing?.id,
+            tree,
+          });
+          this.syncState[file.path] = syncRecord(fp, result.id, prepared.failed.length);
+          collapsed += result.collapsed;
+          if (result.created) created++;
+          else updated++;
+          ok++;
+        } catch (e) {
+          errors.push(`${file.path}: ${e instanceof Error ? e.message : String(e)}`);
         }
-        await this.api.createDocWithMd(nb.id, path, prepared.md);
-        this.syncState[file.path] = fp;
-        ok++;
-      } catch (e) {
-        errors.push(`${file.path}: ${e instanceof Error ? e.message : String(e)}`);
       }
-    }
 
-    if (this.settings.removeMissingNotes) {
-      for (const [hPath, doc] of docIndex) {
-        // Only remove leaf markdown docs; keep container docs (folders).
-        const isLeaf = doc.subFileCount === 0 && doc.name.endsWith('.sy');
-        if (isLeaf && hPath !== '/' && !localPaths.has(hPath) && !hPath.endsWith('/')) {
+      if (this.settings.removeMissingNotes) {
+        const ordered = tree
+          .all()
+          .sort((a, b) => b.hpath.split('/').length - a.hpath.split('/').length);
+        for (const doc of ordered) {
+          if (!isRemovableRemoteDoc(doc.hpath, tree.childCount(doc.id), claimed, root)) continue;
           try {
-            await this.api.removeDoc(nb.id, doc.path);
+            await this.api.removeDocByID(doc.id);
+            tree.remove(doc.id);
             removed++;
           } catch (e) {
-            errors.push(`remove ${hPath}: ${e instanceof Error ? e.message : String(e)}`);
+            errors.push(`remove ${doc.hpath}: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
       }
+
+      const livePaths = new Set(files.map((f) => f.path));
+      for (const key of Object.keys(this.syncState)) {
+        if (!livePaths.has(key)) delete this.syncState[key];
+      }
+
+      await this.saveSettings();
+    } finally {
+      notice.hide();
+      this.endSync();
     }
 
-    await this.saveSettings();
-    notice.hide();
-
     if (errors.length === 0) {
-      new Notice(`SiYuan: synced ${ok} (${created} created, ${updated} updated, ${skipped} skipped${removed ? `, ${removed} removed` : ''}${images ? `, ${images} images` : ''}).`);
+      new Notice(
+        `SiYuan: synced ${ok} (${created} created, ${updated} updated, ${skipped} skipped${removed ? `, ${removed} removed` : ''}${collapsed ? `, ${collapsed} duplicates merged` : ''}${images ? `, ${images} images` : ''}).`,
+      );
     } else {
       new Notice(`SiYuan: synced ${ok}, skipped ${skipped}, failed ${errors.length}.`);
       console.error('SiYuan sync errors', errors);
@@ -400,28 +467,38 @@ export default class SiYuanSyncPlugin extends Plugin {
 
   private async ensureNotebook(): Promise<Notebook> {
     const notebooks = await this.api.listNotebooks();
-    if (this.settings.notebookId) {
-      const nb = notebooks.find((n) => n.id === this.settings.notebookId);
-      if (nb) return nb;
-    }
-    const named = notebooks.find((n) => n.name === 'obsidian');
-    if (named) {
-      this.settings.notebookId = named.id;
+    const target = this.settings.notebook.trim() || this.settings.notebookId;
+    const choice = resolveNotebook(
+      notebooks,
+      target,
+      this.settings.createMissingNotebook,
+    );
+    if (choice.type === 'error') throw new Error(choice.message);
+    let nb: Notebook;
+    if (choice.type === 'create') {
+      nb = await this.api.createNotebook(choice.name);
+      this.settings.notebook = choice.name;
+      this.settings.notebookId = nb.id;
       await this.saveSettings();
-      return named;
+    } else {
+      nb = choice.notebook;
+      if (this.settings.notebookId !== nb.id || (!this.settings.notebook && nb.name)) {
+        this.settings.notebookId = nb.id;
+        if (!this.settings.notebook.trim()) this.settings.notebook = nb.name;
+        await this.saveSettings();
+      }
     }
-    if (!this.settings.createMissingNotebook) {
-      throw new Error('Target notebook not found. Enable create-missing or pick a notebook in settings.');
+    if (nb.closed) {
+      await this.api.openNotebook(nb.id);
+      nb.closed = false;
     }
-    const created = await this.api.createNotebook('obsidian');
-    this.settings.notebookId = created.id;
-    await this.saveSettings();
-    return created;
+    return nb;
   }
 }
 
 class SiYuanSyncSettingTab extends PluginSettingTab {
   private plugin: SiYuanSyncPlugin;
+  private notebookText!: import('obsidian').TextComponent;
   private notebookDropdown!: import('obsidian').DropdownComponent;
   private notebooks: Notebook[] = [];
 
@@ -463,16 +540,80 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName('Local folder')
+      .setDesc('Vault folder to sync. Leave empty for the whole vault. Example: 科锐逆向笔记')
+      .addText((text) =>
+        text
+          .setPlaceholder('科锐逆向笔记')
+          .setValue(this.plugin.settings.localFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.localFolder = value.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('Use current file folder')
+      .addButton((btn) =>
+        btn.setButtonText('Fill from active note').onClick(async () => {
+          const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+          const folder = view?.file?.parent?.path ?? '';
+          if (!folder || folder === '/') {
+            new Notice('Open a note inside the folder you want to sync.');
+            return;
+          }
+          this.plugin.settings.localFolder = folder;
+          await this.plugin.saveSettings();
+          await this.display();
+          new Notice(`Local folder set to ${folder}`);
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName('SiYuan directory')
+      .setDesc('Target path inside the notebook. Leave empty to keep vault-relative paths.')
+      .addText((text) =>
+        text
+          .setValue(this.plugin.settings.remoteDir)
+          .onChange(async (value) => {
+            const v = value.trim();
+            this.plugin.settings.remoteDir = v && !v.startsWith('/') ? `/${v}` : v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName('Target notebook')
-      .setDesc('Notes will sync into this notebook.')
-      .addDropdown((dd) => {
-        this.notebookDropdown = dd;
-        dd.addOption('', 'Loading...');
-        void this.refreshNotebooks();
+      .setDesc(
+        'Notebook name or ID. Saved in this Obsidian vault, so each vault can sync to a different notebook. Type it yourself; the list below is optional.',
+      )
+      .addText((text) => {
+        this.notebookText = text;
+        text
+          .setPlaceholder('obsidian')
+          .setValue(this.plugin.settings.notebook || this.plugin.settings.notebookId)
+          .onChange(async (value) => {
+            this.plugin.settings.notebook = value.trim();
+            await this.plugin.saveSettings();
+          });
       });
 
     new Setting(containerEl)
-      .setName('Refresh notebook list')
+      .setName('Fill from server list')
+      .setDesc('Optional. Refresh SiYuan and pick a name to copy into the field above.')
+      .addDropdown((dd) => {
+        this.notebookDropdown = dd;
+        dd.addOption('', 'Optional…');
+        dd.onChange(async (value) => {
+          if (!value) return;
+          const nb = this.notebooks.find((n) => n.id === value);
+          this.plugin.settings.notebook = nb?.name || value;
+          this.plugin.settings.notebookId = value;
+          this.notebookText.setValue(this.plugin.settings.notebook);
+          await this.plugin.saveSettings();
+        });
+        void this.refreshNotebooks();
+      })
       .addButton((btn) =>
         btn.setButtonText('Refresh').onClick(async () => {
           await this.refreshNotebooks();
@@ -482,7 +623,7 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Create missing notebook')
-      .setDesc('Automatically create a notebook named "obsidian" if it does not exist.')
+      .setDesc('Create the notebook you typed above if it does not exist yet.')
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.createMissingNotebook).onChange(async (value) => {
           this.plugin.settings.createMissingNotebook = value;
@@ -492,7 +633,9 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Remove missing notes')
-      .setDesc('During full sync, remove SiYuan docs whose source note was deleted. Only affects this notebook; use with care.')
+      .setDesc(
+        'During full sync, remove SiYuan docs whose source note was deleted. Only affects this notebook; use with care.',
+      )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.removeMissingNotes).onChange(async (value) => {
           this.plugin.settings.removeMissingNotes = value;
@@ -506,30 +649,16 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
       const api = new SiYuanApi(this.plugin.settings.baseUrl, this.plugin.settings.token);
       this.notebooks = await api.listNotebooks();
       this.notebookDropdown.selectEl.empty();
+      this.notebookDropdown.addOption('', this.notebooks.length === 0 ? 'No notebooks' : 'Optional…');
       this.notebooks.forEach((nb) => {
-        this.notebookDropdown.addOption(nb.id, nb.name);
+        this.notebookDropdown.addOption(nb.id, nb.closed ? `${nb.name} (closed)` : nb.name);
       });
-      const current = this.plugin.settings.notebookId;
-      if (this.notebooks.some((n) => n.id === current)) {
-        this.notebookDropdown.setValue(current);
-      }
-      this.notebookDropdown.selectEl.addEventListener('change', () => {
-        this.plugin.settings.notebookId = this.notebookDropdown.getValue();
-        void this.plugin.saveSettings();
-      });
+      const current = this.plugin.settings.notebook.trim() || this.plugin.settings.notebookId;
+      const match = this.notebooks.find((n) => n.id === current || n.name === current);
+      this.notebookDropdown.setValue(match ? match.id : '');
     } catch (e) {
       this.notebookDropdown.selectEl.empty();
       this.notebookDropdown.addOption('', `Failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 }
-
-
-
-
-
-
-
-
-
-
