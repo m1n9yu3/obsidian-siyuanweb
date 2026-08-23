@@ -27,28 +27,36 @@ function siyuanPathFor(file: TFile): string {
   return `/${file.path}`;
 }
 
+/** Build a map from human-readable path (e.g. /folder/note.md) to filetree entry.
+ * Uses getHPathByID so same-named folders in different parents are not confused. */
+async function buildDocPathIndex(
+  api: SiYuanApi,
+  notebookId: string,
+): Promise<Map<string, FileTreeItem>> {
+  const all: FileTreeItem[] = [];
+  await collectAllDocs(api, notebookId, '/', all);
+  const index = new Map<string, FileTreeItem>();
+  for (const doc of all) {
+    try {
+      const hPath = await api.getHPathByID(doc.id);
+      if (hPath && hPath !== '/') {
+        index.set(hPath, doc);
+      }
+    } catch {
+      // Skip entries that cannot be resolved; they will be recreated on sync.
+    }
+  }
+  return index;
+}
+
 /** Find the filetree entry whose human-readable path equals the target path. */
 async function findDocByHPath(
   api: SiYuanApi,
   notebookId: string,
   target: string,
 ): Promise<FileTreeItem | null> {
-  const segments = target.split('/').filter(Boolean);
-  let dirPath = '/';
-  let files = await api.listDocsByPath(notebookId, dirPath);
-
-  for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i];
-    const isLeaf = i === segments.length - 1;
-    const entry = files.find((f) => f.name === segment || f.name === `${segment}.sy`);
-    if (!entry) return null;
-    if (isLeaf) {
-      return entry.name === `${segment}.sy` || entry.subFileCount === 0 ? entry : null;
-    }
-    if (entry.subFileCount === 0) return null;
-    files = await api.listDocsByPath(notebookId, entry.path);
-  }
-  return null;
+  const index = await buildDocPathIndex(api, notebookId);
+  return index.get(target) ?? null;
 }
 
 /** Recursively collect every doc entry (leaf and container) in a notebook. */
@@ -279,16 +287,17 @@ export default class SiYuanSyncPlugin extends Plugin {
       const prepared = await prepareMarkdown(this.app, this.api, file, rawMd);
       const fp = await fingerprintFor(this.app, file, prepared.md, prepared.imageFiles);
       const path = siyuanPathFor(file);
+      const index = await buildDocPathIndex(this.api, nb.id);
 
       if (this.syncState[file.path] === fp) {
-        const existing = await findDocByHPath(this.api, nb.id, path);
+        const existing = index.get(path);
         if (existing) {
           new Notice(`SiYuan: skipped ${file.name} (unchanged)`);
           return;
         }
       }
 
-      const existing = await findDocByHPath(this.api, nb.id, path);
+      const existing = index.get(path);
       if (existing) {
         await this.api.removeDoc(nb.id, existing.path);
       }
@@ -316,6 +325,7 @@ export default class SiYuanSyncPlugin extends Plugin {
     const files: TFile[] = [];
     await collectMarkdownFiles(this.app.vault.getRoot(), files);
     const localPaths = new Set(files.map((f) => `/${f.path}`));
+    const docIndex = await buildDocPathIndex(this.api, nb.id);
 
     let ok = 0;
     let created = 0;
@@ -340,14 +350,14 @@ export default class SiYuanSyncPlugin extends Plugin {
         const path = siyuanPathFor(file);
 
         if (this.syncState[file.path] === fp) {
-          const existing = await findDocByHPath(this.api, nb.id, path);
+          const existing = docIndex.get(path);
           if (existing) {
             skipped++;
             continue;
           }
         }
 
-        const existing = await findDocByHPath(this.api, nb.id, path);
+        const existing = docIndex.get(path);
         if (existing) {
           await this.api.removeDoc(nb.id, existing.path);
           updated++;
@@ -363,12 +373,10 @@ export default class SiYuanSyncPlugin extends Plugin {
     }
 
     if (this.settings.removeMissingNotes) {
-      const allDocs: FileTreeItem[] = [];
-      await collectAllDocs(this.api, nb.id, '/', allDocs);
-      const leafDocs = allDocs.filter((d) => d.subFileCount === 0 && d.name.endsWith('.sy'));
-      for (const doc of leafDocs) {
-        const hPath = await this.api.getHPathByID(doc.id);
-        if (hPath !== '/' && !localPaths.has(hPath) && !hPath.endsWith('/')) {
+      for (const [hPath, doc] of docIndex) {
+        // Only remove leaf markdown docs; keep container docs (folders).
+        const isLeaf = doc.subFileCount === 0 && doc.name.endsWith('.sy');
+        if (isLeaf && hPath !== '/' && !localPaths.has(hPath) && !hPath.endsWith('/')) {
           try {
             await this.api.removeDoc(nb.id, doc.path);
             removed++;
@@ -515,6 +523,11 @@ class SiYuanSyncSettingTab extends PluginSettingTab {
     }
   }
 }
+
+
+
+
+
 
 
 
